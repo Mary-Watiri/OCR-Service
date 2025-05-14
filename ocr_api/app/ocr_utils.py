@@ -14,51 +14,128 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 # Initialize EasyOCR
 reader = easyocr.Reader(['en', 'sw'], gpu=False)
 
-# Function to convert image bytes to an image object
+# Function to convert image bytes to image object
 def byte_to_image(image_bytes):
-    np_img = np.frombuffer(image_bytes, np.uint8)  
-    image = cv2.imdecode(np_img, cv2.IMREAD_COLOR)  
+    np_img = np.frombuffer(image_bytes, np.uint8)
+    image = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
     return image
 
-def adaptive_resize(image, resize_factor=2.0):
+def adaptive_resize(image, resize_factor=2.0, max_size=None, min_size=None):
     h, w = image.shape[:2]
+    
+    if max_size:
+        scale_factor = max_size / float(max(h, w))
+        if scale_factor < 1:
+            new_h = int(h * scale_factor)
+            new_w = int(w * scale_factor)
+            image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    
+    if min_size:
+        scale_factor = min_size / float(min(h, w))
+        if scale_factor > 1:
+            new_h = int(h * scale_factor)
+            new_w = int(w * scale_factor)
+            image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    
+    # Default resizing logic based on image dimensions
     if max(h, w) < 1000:
         resize_factor = 3.0
     else:
         resize_factor = 1.5
+    
+    # Final resize with the calculated resize_factor
     return cv2.resize(image, None, fx=resize_factor, fy=resize_factor, interpolation=cv2.INTER_LINEAR)
 
-def preprocess_image(image):
-    # Step 1: Resize adaptively (preserve aspect ratio)
-    image = adaptive_resize(image)
+# def preprocess_image(image):
+#     # Step 1: Adaptive resizing to improve text clarity
+#     image = adaptive_resize(image)
 
-    # Step 2: Convert to grayscale
+#     # Step 2: Convert to grayscale
+#     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+#     # Step 3: Reduce noise while preserving edges
+#     blurred = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
+
+#     # Step 4: Invert and threshold the image for contour detection
+#     gray_inv = cv2.bitwise_not(blurred)
+#     _, thresh = cv2.threshold(gray_inv, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+
+#     # Step 5: Skew correction
+#     coords = np.column_stack(np.where(thresh > 0))
+#     angle = cv2.minAreaRect(coords)[-1]
+#     if angle < -45:
+#         angle = -(90 + angle)
+#     else:
+#         angle = -angle
+
+#     # Rotate the image to deskew
+#     (h, w) = image.shape[:2]
+#     M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
+#     rotated = cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+
+#     # Step 6: Apply CLAHE to enhance contrast
+#     gray_rotated = cv2.cvtColor(rotated, cv2.COLOR_BGR2GRAY)
+#     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+#     contrast_enhanced = clahe.apply(gray_rotated)
+
+#     # Step 7: Convert back to 3 channels if needed by downstream models (e.g., CRAFT)
+#     final_img = cv2.cvtColor(contrast_enhanced, cv2.COLOR_GRAY2BGR)
+
+#     return final_img
+
+def preprocess_image(image):
+    # Step 1: Adaptive resizing to balance detail and processing
+    image = adaptive_resize(image, max_size=1200, min_size=600)
+
+    # Step 2: Perspective correction using edge detection
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if contours:
+        largest_contour = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(largest_contour) > 1000:
+            epsilon = 0.02 * cv2.arcLength(largest_contour, True)
+            approx = cv2.approxPolyDP(largest_contour, epsilon, True)
+            if len(approx) == 4:
+                pts = approx.reshape(4, 2)
+                rect = np.zeros((4, 2), dtype="float32")
+                s = pts.sum(axis=1)
+                rect[0] = pts[np.argmin(s)]  
+                rect[2] = pts[np.argmax(s)]  
+                diff = np.diff(pts, axis=1)
+                rect[1] = pts[np.argmin(diff)]  
+                rect[3] = pts[np.argmax(diff)]  
+                
+                (tl, tr, br, bl) = rect
+                width_a = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
+                width_b = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
+                max_width = max(int(width_a), int(width_b))
+                height_a = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
+                height_b = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
+                max_height = max(int(height_a), int(height_b))
+                
+                dst = np.array([
+                    [0, 0],
+                    [max_width - 1, 0],
+                    [max_width - 1, max_height - 1],
+                    [0, max_height - 1]], dtype="float32")
+                
+                M = cv2.getPerspectiveTransform(rect, dst)
+                image = cv2.warpPerspective(image, M, (max_width, max_height))
+
+    # Step 3: Convert to grayscale
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-    # Step 3: Noise reduction
-    blurred = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
+    # Step 4: Light Gaussian blur to reduce noise while preserving text
+    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
 
-    # Step 4: Skew correction
-    gray_inv = cv2.bitwise_not(blurred)
-    thresh = cv2.threshold(gray_inv, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
-    coords = np.column_stack(np.where(thresh > 0))
-    angle = cv2.minAreaRect(coords)[-1]
-    if angle < -45:
-        angle = -(90 + angle)
-    else:
-        angle = -angle
-    (h, w) = image.shape[:2]
-    M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
-    image = cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-
-    # Step 5: Optional contrast normalization
+    # Step 5: CLAHE for localized contrast enhancement
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    gray = clahe.apply(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY))
+    enhanced = clahe.apply(blurred)
 
-    # Step 6: Back to 3 channels for CRAFT
-    final_img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-
-    return final_img
+    # Step 6: Return high-contrast grayscale image for EasyOCR
+    return enhanced
 
 # Example usage for testing
 def extract_text_from_image(image):
@@ -233,15 +310,4 @@ def process_maisha_card_image(image_bytes):
         logging.error(f"Error processing Maisha card image: {str(e)}")
         return json.dumps({"error": str(e)})
 
-if __name__ == "__main__":
-    # Read ID image as bytes
-    with open("kenyaNationalID-circle-2900793588.png", "rb") as f:
-        id_image_bytes = f.read()
-    result_id = process_id_image(id_image_bytes)
-    print("ID Image Result:", result_id)
 
-    # Read Maisha card image as bytes
-    with open("WhatsApp Image 2025-05-14 at 5.07.25 PM.jpeg", "rb") as f:
-        maisha_image_bytes = f.read()
-    result_maisha = process_maisha_card_image(maisha_image_bytes)
-    print("Maisha Card Image Result:", result_maisha)
