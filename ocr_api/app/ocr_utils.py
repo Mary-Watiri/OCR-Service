@@ -1,11 +1,12 @@
+import tempfile
 import cv2
 import easyocr
 import numpy as np
 import re
 import json
-import logging
 from typing import List, Dict
-
+import logging
+logger = logging.getLogger(__name__)
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -13,33 +14,53 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 # Initialize EasyOCR
 reader = easyocr.Reader(['en', 'sw'], gpu=False)
 
-def preprocess_image(image_path, resize_factor=2.0, light_text=False):
-    image = cv2.imread(image_path)
-    if image is None:
-        raise FileNotFoundError(f"Image not found or unreadable: {image_path}")
+# Function to convert image bytes to an image object
+def byte_to_image(image_bytes):
+    np_img = np.frombuffer(image_bytes, np.uint8)  
+    image = cv2.imdecode(np_img, cv2.IMREAD_COLOR)  
+    return image
 
+def adaptive_resize(image, resize_factor=2.0):
     h, w = image.shape[:2]
-    if max(h, w) < 500:
-        resize_factor = min(1.5, resize_factor)
-    image = cv2.resize(image, None, fx=resize_factor, fy=resize_factor, interpolation=cv2.INTER_LINEAR)
+    if max(h, w) < 1000:
+        resize_factor = 3.0
+    else:
+        resize_factor = 1.5
+    return cv2.resize(image, None, fx=resize_factor, fy=resize_factor, interpolation=cv2.INTER_LINEAR)
 
+def preprocess_image(image):
+    # Step 1: Resize adaptively (preserve aspect ratio)
+    image = adaptive_resize(image)
+
+    # Step 2: Convert to grayscale
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    denoised = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
 
+    # Step 3: Noise reduction
+    blurred = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
+
+    # Step 4: Skew correction
+    gray_inv = cv2.bitwise_not(blurred)
+    thresh = cv2.threshold(gray_inv, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
+    coords = np.column_stack(np.where(thresh > 0))
+    angle = cv2.minAreaRect(coords)[-1]
+    if angle < -45:
+        angle = -(90 + angle)
+    else:
+        angle = -angle
+    (h, w) = image.shape[:2]
+    M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
+    image = cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+
+    # Step 5: Optional contrast normalization
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    contrasted = clahe.apply(denoised)
+    gray = clahe.apply(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY))
 
-    thresh_type = cv2.THRESH_BINARY_INV if light_text else cv2.THRESH_BINARY
-    thresh = cv2.adaptiveThreshold(
-        contrasted, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, thresh_type, 15, 11
-    )
+    # Step 6: Back to 3 channels for CRAFT
+    final_img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+    return final_img
 
-    processed = cv2.bitwise_not(closed) if light_text else closed
-    return processed
-
+# Example usage for testing
 def extract_text_from_image(image):
     results = reader.readtext(image, detail=1)
     text = [res[1] for res in results if res[2] > 0.5]
@@ -112,16 +133,13 @@ def normalize_date(text):
     return text.replace(" ", "").replace(".", "-").replace("/", "-")
 
 def is_date(text: str) -> bool:
-    # Match common date formats like DD/MM/YYYY, DD-MM-YYYY, MM/DD/YYYY, etc.
     return bool(re.match(r'^\d{2}[./-]\d{2}[./-]\d{4}$', text))
 
 def is_word(word: str) -> bool:
-    # Check if the word consists only of alphabetic characters and is non-empty
     return bool(re.match(r"^[A-Za-z]+$", word))
 
 def is_id_number(word: str) -> bool:
-    # Assuming ID Number follows a specific pattern like a numeric string of 12 digits
-    return bool(re.match(r"^\d{12}$", word))  # Adjust the regex based on the actual format
+    return bool(re.match(r"^\d{12}$", word))  
 
 
 def extract_maisha_card_fields(ocr_text):
@@ -160,7 +178,6 @@ def extract_maisha_card_fields(ocr_text):
     place_candidates = [word for word in cleaned_text if word.isalpha() and word.isupper() and word not in fields.values()]
     for idx, word in enumerate(cleaned_text):
         if word in place_candidates:
-          
             if "Date of Birth" in fields and word in cleaned_text:
                 dob_index = cleaned_text.index(fields["Date of Birth"])
                 expiry_index = cleaned_text.index(fields["Expiry Date"]) if "Expiry Date" in fields else len(cleaned_text)
@@ -174,23 +191,39 @@ def extract_maisha_card_fields(ocr_text):
     logging.info(f"Final extracted Maisha Card fields: {fields}")
     return fields
 
-def process_id_image(image_path):
+def process_id_image(image_bytes):
     try:
-        processed_image = preprocess_image(image_path, light_text=False)
+        # Convert bytes to image
+        image = byte_to_image(image_bytes)
+        
+        # Preprocess image
+        processed_image = preprocess_image(image)
+        
+        # Extract text using EasyOCR
         ocr_text = extract_text_from_image(processed_image)
+        
+        # Extract structured fields
         fields = extract_fields(ocr_text)
+        
         return json.dumps(fields, indent=2)
     except Exception as e:
         logging.error(f"Error processing ID image: {str(e)}")
         return json.dumps({"error": str(e)})
 
-def process_maisha_card_image(image_path):
+def process_maisha_card_image(image_bytes):
     try:
-        processed_image = preprocess_image(image_path, resize_factor=3.2, light_text=True)
+        # Convert bytes to image
+        image = byte_to_image(image_bytes)
+        
+        # Preprocess image
+        processed_image = preprocess_image(image)
+        
+        # Extract text using EasyOCR
         ocr_text = extract_text_from_image(processed_image)
         
         logging.info(f"Extracted text: {ocr_text}")
         
+        # Extract structured fields
         fields = extract_maisha_card_fields(ocr_text)
         
         logging.info(f"Final extracted Maisha Card fields: {fields}")
@@ -201,12 +234,14 @@ def process_maisha_card_image(image_path):
         return json.dumps({"error": str(e)})
 
 if __name__ == "__main__":
-    # Test processing an ID image
-    id_image_path = "kenyaNationalID-circle-2900793588.png"
-    result_id = process_id_image(id_image_path)
+    # Read ID image as bytes
+    with open("kenyaNationalID-circle-2900793588.png", "rb") as f:
+        id_image_bytes = f.read()
+    result_id = process_id_image(id_image_bytes)
     print("ID Image Result:", result_id)
 
-    # Test processing a Maisha card image
-    maisha_image_path = "WhatsApp Image 2025-05-06 at 3.45.07 PM(1).jpeg"
-    result_maisha = process_maisha_card_image(maisha_image_path)
+    # Read Maisha card image as bytes
+    with open("WhatsApp Image 2025-05-14 at 5.07.25 PM.jpeg", "rb") as f:
+        maisha_image_bytes = f.read()
+    result_maisha = process_maisha_card_image(maisha_image_bytes)
     print("Maisha Card Image Result:", result_maisha)
