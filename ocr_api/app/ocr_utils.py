@@ -144,80 +144,226 @@ def extract_text_from_image(image):
     logging.info(f"Extracted text: {text}")
     return text
 
+
 def extract_fields(ocr_text):
+    fields = {}
+    field_sources = {}
+
+    def clean_text(text):
+        return text.strip(" :,.").upper()
+
+    cleaned_text = [clean_text(word) for word in ocr_text if word.strip()]
+    logging.info(f"Cleaned OCR Text for Kenyan ID: {cleaned_text}")
+
+    def is_date(text):
+        return bool(re.match(r'\d{2}[./-]\d{2}[./-]\d{4}', text.replace(" ", "")))
+
+    def is_id_number(text):
+        return bool(re.match(r'^\d{8,10}$', text))
+
+    def is_name_part(text):
+        return bool(re.match(r'^[A-Z]+$', text)) and text not in {"SEX", "MALE", "FEMALE", "X", "HALE"}
+
+    def infer_sex(text):
+        text_upper = text.upper()
+        if text_upper in {"MALE", "X", "HALE", "ALE", "MA"} or (text_upper.startswith("M") and len(text_upper) == 4):
+            return "Male"
+        if text_upper in {"FEMALE", "FMALE", "FEMLE", "FEM"} or (text_upper.startswith("F") and len(text_upper) >= 5):
+            return "Female"
+        return None
+
+    def fuzzy_label_match(text, labels):
+        text_clean = text.replace(" ", "")
+        for label in labels:
+            if label.replace(" ", "") in text_clean or text_clean in label.replace(" ", ""):
+                return labels[label]
+        return None
+
     field_labels = {
         "SERIAL NUMBER": "Serial Number",
+        "SERIALNUNBER": "Serial Number",
         "ID NUMBER": "ID Number",
-        "ID NO": "ID Number",
         "FULL NAMES": "Full Names",
-        "NAMES": "Full Names",
+        "DATE OF BIRTH": "Date of Birth",
         "SEX": "Sex",
-        "GENDER": "Sex",
-        "DISTRICT OF BIRTH": "Place of Birth",
+        "DISTRICT OF BIRTH": "District of Birth",
         "PLACE OF ISSUE": "Place of Issue",
         "DATE OF ISSUE": "Date of Issue",
         "HOLDER'S SIGN": "Holder's Signature",
-        "SIGNATURE": "Holder's Signature",
-        "NATIONALITY": "Nationality",
     }
 
-    def is_date(text):
-        return re.match(r'\d{2}[./-]\d{2}[./-]\d{4}', text.replace(" ", "")) is not None
-
-    cleaned_text = [w.strip(" :,.").upper() for w in ocr_text if w.strip()]
-    logging.info(f"Cleaned OCR Text: {cleaned_text}")
-
-    fields = {}
     idx = 0
+    dates_collected = []
+    numbers_collected = []
+
     while idx < len(cleaned_text):
         word = cleaned_text[idx]
+        matched_label = fuzzy_label_match(word, field_labels)
 
-        # Date of Birth
-        if "FULL NAMES" in word and idx + 3 < len(cleaned_text):
-            surname = cleaned_text[idx + 1]
-            maybe_given = cleaned_text[idx + 2]
-            maybe_dob = cleaned_text[idx + 3]
-
-            fields["Surname"] = surname
-            if is_date(maybe_dob):
-                fields["Given Names"] = maybe_given
-                fields["Date of Birth"] = maybe_dob.replace(" ", "").replace(".", "-").replace("/", "-")
-                idx += 3
-            else:
-                fields["Given Names"] = f"{maybe_given} {maybe_dob}"
-                if idx + 4 < len(cleaned_text) and is_date(cleaned_text[idx + 4]):
-                    fields["Date of Birth"] = cleaned_text[idx + 4].replace(" ", "").replace(".", "-").replace("/", "-")
-                    idx += 4
-                else:
-                    idx += 2
-        elif word in field_labels:
-            label = field_labels[word]
+        if matched_label:
+            label = matched_label
             if idx + 1 < len(cleaned_text):
                 next_word = cleaned_text[idx + 1]
-                if is_date(next_word):
-                    fields[label] = next_word.replace(" ", "").replace(".", "-").replace("/", "-")
+
+                if label in {"Date of Birth", "Date of Issue"}:
+                    if is_date(next_word):
+                        date_val = next_word.replace(" ", "").replace(".", "-").replace("/", "-")
+                        fields[label] = date_val
+                        field_sources[label] = f"Matched label: {word} + valid date"
+                        dates_collected.append(next_word)
+                    else:
+                        fields[label] = next_word
+                        field_sources[label] = f"Matched label: {word} + fallback"
+                    idx += 1
+
+                elif label == "Full Names":
+                    name_parts = []
+                    temp_idx = idx + 1
+                    while temp_idx < len(cleaned_text):
+                        next_part = cleaned_text[temp_idx]
+                        if is_date(next_part) or fuzzy_label_match(next_part, field_labels):
+                            break
+                        if is_name_part(next_part):
+                            name_parts.append(next_part)
+                        temp_idx += 1
+                    if name_parts:
+                        fields[label] = " ".join(name_parts).title()
+                        field_sources[label] = f"Matched label: {word} + name parts"
+                    idx = temp_idx - 1
+
+                elif label == "Sex":
+                    inferred = infer_sex(next_word)
+                    fields[label] = inferred if inferred else next_word
+                    field_sources[label] = f"Matched label: {word} + inferred sex"
+                    idx += 1
+
+                elif label in {"Serial Number", "ID Number"}:
+                    if is_id_number(next_word):
+                        fields[label] = next_word
+                        field_sources[label] = f"Matched label: {word} + valid ID"
+                        numbers_collected.append(next_word)
+                    else:
+                        fields[label] = next_word
+                        field_sources[label] = f"Matched label: {word} + fallback"
+                    idx += 1
+
                 else:
                     fields[label] = next_word
-                idx += 1
+                    field_sources[label] = f"Matched label: {word}"
+                    idx += 1
+
+        elif is_date(word):
+            dates_collected.append(word)
+        elif is_id_number(word):
+            numbers_collected.append(word)
         idx += 1
 
-    if "Surname" in fields and "Given Names" in fields:
-        fields["Full Name"] = f"{fields['Surname']} {fields['Given Names']}".strip()
+    # Fallback: Dates
+    if dates_collected:
+        if "Date of Birth" not in fields:
+            fields["Date of Birth"] = dates_collected[0].replace(" ", "").replace(".", "-").replace("/", "-")
+            field_sources["Date of Birth"] = "Fallback from collected dates"
+        if len(dates_collected) > 1 and "Date of Issue" not in fields:
+            fields["Date of Issue"] = dates_collected[1].replace(" ", "").replace(".", "-").replace("/", "-")
+            field_sources["Date of Issue"] = "Fallback from collected dates"
+
+    # Fallback: Numbers
+    if numbers_collected:
+        if "Serial Number" not in fields:
+            fields["Serial Number"] = numbers_collected[0]
+            field_sources["Serial Number"] = "Fallback from collected numbers"
+        if len(numbers_collected) > 1 and "ID Number" not in fields:
+            fields["ID Number"] = numbers_collected[1]
+            field_sources["ID Number"] = "Fallback from collected numbers"
+
+    # Full Names extraction with fallback
+    try:
+        start = cleaned_text.index("FULL NAMES") + 1
+        stop_labels = {"DATE OF BIRTH", "SEX", "DISTRICT OF BIRTH"}
+        end = next((i for i in range(start, len(cleaned_text)) if cleaned_text[i] in stop_labels), len(cleaned_text))
+        name_parts = cleaned_text[start:end]
+        if name_parts:
+            full_name = " ".join(name_parts).title()
+            fields["Full Names"] = full_name
+            field_sources["Full Names"] = "Matched label: FULL NAMES + name parts"
+    except ValueError:
+        # Fallback: Scan through cleaned text to find best candidate
+        possible_names = []
+        skip_words = set(field_labels.keys()) | {"KENYA", "JAMHURI", "REPUBLIC", "OF"}
+
+        for word in cleaned_text:
+            word_parts = word.split()
+            if any(part in skip_words for part in word_parts):
+                continue
+            if all(is_name_part(part) for part in word_parts) and len(word_parts) >= 2:
+                possible_names.append(word_parts)
+
+        if possible_names:
+            best_name = max(possible_names, key=len)
+            fields["Full Names"] = " ".join(best_name).title()
+            field_sources["Full Names"] = "Fallback from filtered longest match"
+
+    # Fallback: Sex
+    if "Sex" not in fields:
+        for word in cleaned_text:
+            inferred = infer_sex(word)
+            if inferred:
+                fields["Sex"] = inferred
+                field_sources["Sex"] = f"Fallback from inferred sex: {word}"
+                break
+
+    # Heuristic: District of Birth & Place of Issue
+    dob_date = fields.get("Date of Birth", "").replace("-", ".")
+    doi_date = fields.get("Date of Issue", "").replace("-", ".")
+    for idx, word in enumerate(cleaned_text):
+        if is_name_part(word) and word not in fields.values() and word not in fields.get("Full Names", "").upper().split():
+            if "District of Birth" not in fields and dob_date and dob_date in cleaned_text:
+                dob_index = cleaned_text.index(dob_date)
+                if idx > dob_index:
+                    fields["District of Birth"] = word.title()
+                    field_sources["District of Birth"] = f"Heuristic after Date of Birth: {word}"
+                    continue
+            if "Place of Issue" not in fields and doi_date and doi_date in cleaned_text:
+                doi_index = cleaned_text.index(doi_date)
+                if idx > doi_index:
+                    fields["Place of Issue"] = word.title()
+                    field_sources["Place of Issue"] = f"Heuristic after Date of Issue: {word}"
+
+    # Fallback: Based on position after SEX
+    if "District of Birth" not in fields or "Place of Issue" not in fields:
+        try:
+            sex_index = None
+            if "FEMALE" in cleaned_text:
+                sex_index = cleaned_text.index("FEMALE")
+            elif "MALE" in cleaned_text:
+                sex_index = cleaned_text.index("MALE")
+
+            if sex_index is not None:
+                location_candidates = []
+                for i in range(sex_index + 1, min(len(cleaned_text), sex_index + 5)):
+                    val = cleaned_text[i]
+                    if all(part.isalpha() for part in val.split()):
+                        location_candidates.append(val.title())
+
+                if "District of Birth" not in fields and len(location_candidates) >= 1:
+                    fields["District of Birth"] = location_candidates[0]
+                    field_sources["District of Birth"] = "Based on position after SEX"
+                if "Place of Issue" not in fields and len(location_candidates) >= 2:
+                    fields["Place of Issue"] = location_candidates[1]
+                    field_sources["Place of Issue"] = "Based on position after District of Birth"
+        except ValueError:
+            pass
+
+    # Nationality detection
+    full_text = " ".join(cleaned_text)
+    if any(keyword in full_text for keyword in ["JAMHURI YA KENYA", "REPUBLIC OF KENYA", "KENYA"]):
+        fields["Nationality"] = "Kenyan"
+        field_sources["Nationality"] = "Detected 'KENYA' in OCR text"
+
+    logging.info(f"Final extracted Kenyan ID fields: {fields}")
+    logging.info(f"Field sources: {field_sources}")
 
     return fields
-
-def normalize_date(text):
-    return text.replace(" ", "").replace(".", "-").replace("/", "-")
-
-def is_date(text: str) -> bool:
-    return bool(re.match(r'^\d{2}[./-]\d{2}[./-]\d{4}$', text))
-
-def is_word(word: str) -> bool:
-    return bool(re.match(r"^[A-Za-z]+$", word))
-
-def is_id_number(word: str) -> bool:
-    return bool(re.match(r"^\d{12}$", word))  
-
 
 def extract_maisha_card_fields(ocr_text):
     fields = {}
