@@ -9,15 +9,19 @@ app = FastAPI()
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
+import json
+
 @app.post("/process/id")
 async def process_id(file: UploadFile = File(...)):
     try:
         image_bytes = await file.read()
-        result = process_id_image(image_bytes)
-        return JSONResponse(content=result)
+        result_json_str = process_id_image(image_bytes) 
+        result_dict = json.loads(result_json_str)      
+        return JSONResponse(content=result_dict)
     except Exception as e:
         logger.error(f"Error processing ID image: {e}")
         return JSONResponse(status_code=500, content={"error": str(e)})
+
 
 @app.post("/process/maisha")
 async def process_maisha(file: UploadFile = File(...)):
