@@ -6,7 +6,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --default-timeout=100 -r requirements.txt
 
 
-COPY ocr_api .
+COPY main.py .
+COPY ocr_utils.py .
 
 EXPOSE 8000
 

@@ -1,6 +1,7 @@
 fastapi
 uvicorn
 easyocr
-opencv-python
+opencv-python-headless
 numpy
 pydantic
+python-multipart
