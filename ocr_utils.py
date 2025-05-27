@@ -46,42 +46,82 @@ def adaptive_resize(image, resize_factor=2.0, max_size=None, min_size=None):
     # Final resize with the calculated resize_factor
     return cv2.resize(image, None, fx=resize_factor, fy=resize_factor, interpolation=cv2.INTER_LINEAR)
 
-# def preprocess_image(image):
-#     # Step 1: Adaptive resizing to improve text clarity
-#     image = adaptive_resize(image)
 
-#     # Step 2: Convert to grayscale
-#     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+def preprocess_maisha_card_image(image):
+    # Check if the input image is valid
+    if image is None or image.size == 0:
+        raise ValueError("Invalid input image")
 
-#     # Step 3: Reduce noise while preserving edges
-#     blurred = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
+    # Step 1: Adaptive resizing to standardize DPI (target ~300 DPI)
+    def adaptive_resize(img, target_height=800):
+        h, w = img.shape[:2]
+        scale = target_height / h
+        new_w, new_h = int(w * scale), int(h * scale)
+        return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
 
-#     # Step 4: Invert and threshold the image for contour detection
-#     gray_inv = cv2.bitwise_not(blurred)
-#     _, thresh = cv2.threshold(gray_inv, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+    image = adaptive_resize(image)
 
-#     # Step 5: Skew correction
-#     coords = np.column_stack(np.where(thresh > 0))
-#     angle = cv2.minAreaRect(coords)[-1]
-#     if angle < -45:
-#         angle = -(90 + angle)
-#     else:
-#         angle = -angle
+    # Step 2: Convert to grayscale
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-#     # Rotate the image to deskew
-#     (h, w) = image.shape[:2]
-#     M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
-#     rotated = cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    # Step 3: Reduce noise with non-local means and bilateral filter
+    denoised = cv2.fastNlMeansDenoising(gray, h=10, templateWindowSize=7, searchWindowSize=21)
+    blurred = cv2.GaussianBlur(denoised, (5, 5), 0)
+    denoised = cv2.bilateralFilter(blurred, d=9, sigmaColor=75, sigmaSpace=75)
 
-#     # Step 6: Apply CLAHE to enhance contrast
-#     gray_rotated = cv2.cvtColor(rotated, cv2.COLOR_BGR2GRAY)
-#     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-#     contrast_enhanced = clahe.apply(gray_rotated)
+    # Step 4: Sharpening to enhance text edges
+    sharpening_kernel = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]])
+    sharpened = cv2.filter2D(denoised, -1, sharpening_kernel)
 
-#     # Step 7: Convert back to 3 channels if needed by downstream models (e.g., CRAFT)
-#     final_img = cv2.cvtColor(contrast_enhanced, cv2.COLOR_GRAY2BGR)
+    # Step 5: Invert and threshold the image
+    gray_inv = cv2.bitwise_not(sharpened)
+    _, otsu_thresh = cv2.threshold(gray_inv, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    adaptive_thresh = cv2.adaptiveThreshold(gray_inv, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 19, 4)
+    thresh = cv2.bitwise_and(otsu_thresh, adaptive_thresh)
 
-#     return final_img
+    # Step 6: Morphological operations to clean noise and connect text
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    cleaned = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
+    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel, iterations=2)  # Increase iterations for better connection
+    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), iterations=1)
+
+    # Step 7: Skew correction
+    coords = np.column_stack(np.where(cleaned > 0))
+    if len(coords) > 0:
+        angle = cv2.minAreaRect(coords)[-1]
+        if angle < -45:
+            angle = -(90 + angle)
+        else:
+            angle = -angle
+        (h, w) = image.shape[:2]
+        M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
+        rotated = cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    else:
+        rotated = image
+
+    # Step 8: Convert rotated image to grayscale and apply CLAHE
+    gray_rotated = cv2.cvtColor(rotated, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=5.0, tileGridSize=(8, 8))
+    contrast_enhanced = clahe.apply(gray_rotated)
+
+    # # Step 9: Text region detection and cropping
+    # contours, _ = cv2.findContours(contrast_enhanced, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # if contours:
+    #     # Sort contours by area and select the largest text region
+    #     contours = sorted(contours, key=cv2.contourArea, reverse=True)
+    #     for contour in contours:
+    #         x, y, w, h = cv2.boundingRect(contour)
+    #         # Ensure the region includes the right side where Date of Birth is located
+    #         if x + w < image.shape[1] and h > 10:  # Minimum height to avoid noise
+    #             text_region = contrast_enhanced[y:y+h, x:x+w]
+    #             if text_region.size > 0:
+    #                 contrast_enhanced = text_region
+    #             break
+
+    # Step 10: Convert back to 3 channels
+    final_img = cv2.cvtColor(contrast_enhanced, cv2.COLOR_GRAY2BGR)
+
+    return final_img
 
 def preprocess_image(image):
     # Step 1: Adaptive resizing to balance detail and processing
@@ -181,7 +221,7 @@ def extract_fields(ocr_text):
 
     field_labels = {
         "SERIAL NUMBER": "Serial Number",
-        "SERIALNUNBER": "Serial Number",
+        "SERIALNUNBER": "SerialNumber",
         "ID NUMBER": "ID Number",
         "FULL NAMES": "Full Names",
         "DATE OF BIRTH": "Date of Birth",
@@ -205,7 +245,7 @@ def extract_fields(ocr_text):
             if idx + 1 < len(cleaned_text):
                 next_word = cleaned_text[idx + 1]
 
-                if label in {"Date of Birth", "Date of Issue"}:
+                if label in {"Date of Birth", "Date ofIssue"}:
                     if is_date(next_word):
                         date_val = next_word.replace(" ", "").replace(".", "-").replace("/", "-")
                         fields[label] = date_val
@@ -365,20 +405,31 @@ def extract_fields(ocr_text):
 
     return fields
 
+def correct_date_format(word):
+    """Fix common OCR date issues."""
+    if re.fullmatch(r'\d{8}', word): 
+        return f"{word[:2]}.{word[2:4]}.{word[4:]}"
+    elif re.fullmatch(r'\d{4}\.\d{4}', word):  
+        return f"{word[:2]}.{word[2:4]}.{word[5:]}"
+    return word
+
 def extract_maisha_card_fields(ocr_text):
     fields = {}
     cleaned_text = [word.upper().replace(' ', '') for word in ocr_text if word.strip()]
     logging.info(f"Cleaned OCR Text for Maisha Card: {cleaned_text}")
 
-    # Extract dates
-    dates = [word.replace(' ', '') for word in cleaned_text if re.match(r'\d{2}\.\d{2}\.\d{4}', word.replace(' ', ''))]
-    if len(dates) >= 1:
+    # Correct malformed dates
+    corrected_dates = [correct_date_format(word) for word in cleaned_text]
+    dates = [d for d in corrected_dates if re.fullmatch(r'\d{2}\.\d{2}\.\d{4}', d)]
+
+    if len(dates) == 1:
+        fields["Expiry Date"] = dates[0]
+    elif len(dates) >= 2:
         fields["Date of Birth"] = dates[0]
-    if len(dates) >= 2:
         fields["Expiry Date"] = dates[1]
 
-    # Extract ID number: usually a 9-digit number
-    id_number = next((word for word in cleaned_text if re.match(r'^\d{8,10}$', word)), None)
+    # Extract ID number
+    id_number = next((word for word in cleaned_text if re.fullmatch(r'\d{8,10}', word)), None)
     if id_number:
         fields["ID Number"] = id_number
 
@@ -391,25 +442,58 @@ def extract_maisha_card_fields(ocr_text):
     if "KEN" in cleaned_text or "KENYAN" in cleaned_text:
         fields["Nationality"] = "Kenyan"
 
-    # Extract names (before gender)
-    if gender:
+    # Exclude known non-name tokens
+    EXCLUDED_TOKENS = {"NATIONALIDENTITYCARD", "KEN", "KENYAN", "MALE", "FEMALE"}
+
+    # Extract full names
+    if gender and gender in cleaned_text:
         gender_index = cleaned_text.index(gender)
-        possible_names = cleaned_text[:gender_index]
-        fields["Full Names"] = " ".join(possible_names).title()
+        name_parts = [
+            word.title()
+            for word in cleaned_text[:gender_index]
+            if word.isalpha() and word not in EXCLUDED_TOKENS
+        ]
+        if name_parts:
+            fields["Full Names"] = " ".join(name_parts)
 
-    # Determine place of birth / issue using context
-    place_candidates = [word for word in cleaned_text if word.isalpha() and word.isupper() and word not in fields.values()]
+    # --- Refined logic for Place of Birth and Issue ---
+    dob_index = next((i for i, word in enumerate(cleaned_text)
+                      if correct_date_format(word) == fields.get("Date of Birth")), -1)
+    expiry_index = next((i for i, word in enumerate(cleaned_text)
+                         if correct_date_format(word) == fields.get("Expiry Date")), -1)
+
+    location_candidates = []
+    full_name_tokens = []
+    if "Full Names" in fields:
+        full_name_tokens = [part.upper() for part in fields["Full Names"].split()]
+
+    field_values_upper = {
+        str(v).upper().replace(' ', '') for v in fields.values()
+    }.union(full_name_tokens)
+
     for idx, word in enumerate(cleaned_text):
-        if word in place_candidates:
-            if "Date of Birth" in fields and word in cleaned_text:
-                dob_index = cleaned_text.index(fields["Date of Birth"])
-                expiry_index = cleaned_text.index(fields["Expiry Date"]) if "Expiry Date" in fields else len(cleaned_text)
-                word_index = cleaned_text.index(word)
+        if word.isalpha() and word not in EXCLUDED_TOKENS and word not in field_values_upper:
+            location_candidates.append((idx, word.title()))
 
-                if dob_index < word_index < expiry_index:
-                    fields["Place of Birth"] = word.title()
-                elif word_index > expiry_index:
-                    fields["Place of Issue"] = word.title()
+    place_of_birth = None
+    place_of_issue = None
+
+    for idx, place in location_candidates:
+        if dob_index != -1 and expiry_index != -1:
+            if dob_index < idx < expiry_index and not place_of_birth:
+                place_of_birth = place
+            elif idx > expiry_index and not place_of_issue:
+                place_of_issue = place
+        elif expiry_index != -1:
+            if idx < expiry_index and not place_of_birth:
+                place_of_birth = place
+            elif idx > expiry_index and not place_of_issue:
+                place_of_issue = place
+
+    if place_of_birth:
+        fields["Place of Birth"] = place_of_birth
+    if place_of_issue and place_of_issue != place_of_birth:
+        fields["Place of Issue"] = place_of_issue
 
     logging.info(f"Final extracted Maisha Card fields: {fields}")
     return fields
@@ -439,7 +523,7 @@ def process_maisha_card_image(image_bytes):
         image = byte_to_image(image_bytes)
         
         # Preprocess image
-        processed_image = preprocess_image(image)
+        processed_image = preprocess_maisha_card_image(image)
         
         # Extract text using EasyOCR
         ocr_text = extract_text_from_image(processed_image)

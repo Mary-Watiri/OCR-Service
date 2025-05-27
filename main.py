@@ -27,8 +27,9 @@ async def process_id(file: UploadFile = File(...)):
 async def process_maisha(file: UploadFile = File(...)):
     try:
         image_bytes = await file.read()
-        result = process_maisha_card_image(image_bytes)
-        return JSONResponse(content=result)
+        result_json_str = process_maisha_card_image(image_bytes) 
+        result_dict = json.loads(result_json_str)
+        return JSONResponse(content=result_dict)
     except Exception as e:
         logger.error(f"Error processing Maisha card image: {e}")
         return JSONResponse(status_code=500, content={"error": str(e)})
