@@ -383,8 +383,6 @@ def extract_maisha_card_fields(ocr_text):
     # Step 1: Normalize text
     cleaned_text = [str(word).upper().replace(' ', '') for word in ocr_text if str(word).strip()]
 
-    
-    # Remove header like "JAMHURIYAKENYA" if it's the first word
     if cleaned_text and cleaned_text[0] in {"JAMHURIYAKENYA", "REPUBLICOFKENYA"}:
         cleaned_text = cleaned_text[1:]
 
@@ -394,35 +392,32 @@ def extract_maisha_card_fields(ocr_text):
     corrected_dates = [correct_date_format(word) for word in cleaned_text]
     dates = [d for d in corrected_dates if isinstance(d, str) and re.fullmatch(r'\d{2}\.\d{2}\.\d{4}', d)]
 
-
     # Step 3: Extract gender
     gender = next((word for word in cleaned_text if word in {"MALE", "FEMALE"}), None)
     if gender:
         fields["Gender"] = gender
 
-    # Step 4: Extract ID number (8–10 digit number)
+    # Step 4: Extract ID number
     id_number = next((word for word in cleaned_text if re.fullmatch(r'\d{8,10}', word)), None)
     if id_number:
         fields["ID Number"] = id_number
 
-    nationality_candidates = [] 
+    # Step 5: DOB from nationality position (optional)
     dob_from_nationality = None
     for i, word in enumerate(cleaned_text):
-        if word in nationality_candidates and i + 1 < len(cleaned_text):
+        if word in {"KEN", "KENYAN"} and i + 1 < len(cleaned_text):
             possible_dob = correct_date_format(cleaned_text[i + 1])
-            # Validate parsed date format before assigning
             if parse_date_safe(possible_dob):
                 dob_from_nationality = possible_dob
-            fields["Nationality"] = "Kenyan"
-            break
+                fields["Nationality"] = "Kenyan"
+                break
 
+    # Step 6: Assign DOB and Expiry
     dob, expiry = assign_dob_expiry_from_dates(dates)
-
-    # Override DOB if nationality-based DOB is valid and earlier
-    if dob_from_nationality and parse_date_safe(dob_from_nationality):
+    if dob_from_nationality:
         nat_dob_dt = parse_date_safe(dob_from_nationality)
         dob_dt = parse_date_safe(dob) if dob else None
-        if not dob_dt or nat_dob_dt < dob_dt:
+        if not dob_dt or (nat_dob_dt and nat_dob_dt < dob_dt):
             dob = dob_from_nationality
 
     if dob:
@@ -430,65 +425,87 @@ def extract_maisha_card_fields(ocr_text):
     if expiry:
         fields["Expiry Date"] = expiry
 
-    # Step 8: Full Names — words before gender (excluding known tokens)
+    # Step 7: Extract full names
     EXCLUDED_TOKENS = {"NATIONALIDENTITYCARD", "KEN", "KENYAN", "MALE", "FEMALE", "JAMHURIYAKENYA", "REPUBLICOFKENYA"}
-
     if gender and gender in cleaned_text:
         gender_index = cleaned_text.index(gender)
-        name_parts = [
-            word.title()
-            for word in cleaned_text[:gender_index]
+        raw_name_parts = [
+            word for word in cleaned_text[:gender_index]
             if word.isalpha() and word not in EXCLUDED_TOKENS
         ]
+
+        # Heuristically split long uppercase name strings (e.g., "LILIANWAYUA")
+        name_parts = []
+        for word in raw_name_parts:
+            if len(word) > 10:
+                # Try to split the word into two capitalized names using common patterns
+                split_match = re.findall(r'[A-Z][a-z]+', word.title())
+                if split_match:
+                    name_parts.extend(split_match)
+                else:
+                    name_parts.append(word.title())
+            else:
+                name_parts.append(word.title())
+
         if name_parts:
             fields["Full Names"] = " ".join(name_parts)
 
-          # Step 9: Location (Place of Birth and Issue)
-    dob_field = fields.get("Date of Birth")
-    expiry_field = fields.get("Expiry Date")
 
+    # Step 8: Identify DOB and Expiry indices in cleaned_text
     dob_index = -1
     expiry_index = -1
 
-    if dob_field:
-        dob_index = next(
-            (i for i, word in enumerate(cleaned_text)
-            if isinstance(word, str) and correct_date_format(word) == dob_field),
-            -1
-        )
+    if dob:
+        for i, word in enumerate(cleaned_text):
+            if correct_date_format(word) == dob:
+                dob_index = i
+                break
 
-    if expiry_field:
-        expiry_index = next(
-            (i for i, word in enumerate(cleaned_text)
-            if isinstance(word, str) and correct_date_format(word) == expiry_field),
-            -1
-        )
+    if expiry:
+        for i, word in enumerate(cleaned_text):
+            if correct_date_format(word) == expiry:
+                expiry_index = i
+                break
 
+    logging.info(f"DOB index: {dob_index}, Expiry index: {expiry_index}")
 
-        location_candidates = []
-        full_name_tokens = [part.upper() for part in fields.get("Full Names", "").split()]
-        field_values_upper = {
-            str(v).upper().replace(' ', '') for v in fields.values()
-        }.union(full_name_tokens)
+    # Step 9: Extract location candidates
+    used_tokens = set()
+    if "Full Names" in fields:
+        used_tokens.update(word.upper() for word in fields["Full Names"].split())
+    if "Gender" in fields:
+        used_tokens.add(fields["Gender"])
+    if "ID Number" in fields:
+        used_tokens.add(fields["ID Number"])
 
-        for idx, word in enumerate(cleaned_text):
-            if word.isalpha() and word not in EXCLUDED_TOKENS and word not in field_values_upper:
-                location_candidates.append((idx, word.title()))
+    location_candidates = []
+    for idx, word in enumerate(cleaned_text):
+        if word.isalpha() and word not in EXCLUDED_TOKENS and word not in used_tokens:
+            location_candidates.append((idx, word.title()))
 
+    logging.info(f"Location candidates: {location_candidates}")
+
+    # Step 10: Assign Place of Birth and Issue based on date positions
     place_of_birth = None
     place_of_issue = None
-
+    
     for idx, place in location_candidates:
         if dob_index != -1 and expiry_index != -1:
             if dob_index < idx < expiry_index and not place_of_birth:
                 place_of_birth = place
             elif idx > expiry_index and not place_of_issue:
                 place_of_issue = place
-        elif expiry_index != -1:
+        elif dob_index != -1 and expiry_index == -1:
+            if idx > dob_index and not place_of_birth:
+                place_of_birth = place
+            elif idx > dob_index and place_of_birth and not place_of_issue:
+                place_of_issue = place
+        elif expiry_index != -1 and dob_index == -1:
             if idx < expiry_index and not place_of_birth:
                 place_of_birth = place
             elif idx > expiry_index and not place_of_issue:
                 place_of_issue = place
+
 
     if place_of_birth:
         fields["Place of Birth"] = place_of_birth
@@ -497,6 +514,7 @@ def extract_maisha_card_fields(ocr_text):
 
     logging.info(f"Final extracted Maisha Card fields: {fields}")
     return fields
+
 
 def process_id_image(image_bytes):
     try:
