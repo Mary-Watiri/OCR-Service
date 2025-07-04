@@ -6,7 +6,11 @@ import re
 import json
 from datetime import datetime
 from typing import List, Dict
+from passporteye import read_mrz
 import logging
+from typing import Optional
+
+
 logger = logging.getLogger(__name__)
 
 # Setup logging
@@ -542,4 +546,88 @@ def process_maisha_card_image(image_bytes):
         return json.dumps(fields, indent=2)
     except Exception as e:
         logging.error(f"Error processing Maisha card image: {str(e)}")
+
+        return json.dumps({"error": str(e)})
+    
+def extract_text_from_passport_image(image_array):
+    reader = easyocr.Reader(['en'])
+    results = reader.readtext(image_array, detail=0)
+    return " ".join(results)
+    
+
+def extract_passport_fields(text: str) -> dict:
+    data = {
+        "passport_number": "",
+        "surname": "",
+        "given_names": "",
+        "nationality": "",
+        "date_of_birth": "",
+        "gender": "",
+        "place_of_birth": "",
+        "date_of_issue": "",
+        "expiry_date": "",
+        "raw_text": text
+    }
+
+    # --- MRZ extraction ---
+    mrz_match = re.search(
+        r"P<([A-Z]{3})([A-Z<]+)<<([A-Z<]+)<([MF])",
+        text
+    )
+    if mrz_match:
+        country_code = mrz_match.group(1)
+        surname_raw = mrz_match.group(2)
+        given_names_raw = mrz_match.group(3)
+        gender = mrz_match.group(4)
+
+        surname = surname_raw.replace("<", "")
+        given_names = given_names_raw.replace("<", " ").strip()
+
+        data["surname"] = surname
+        data["given_names"] = given_names
+        data["nationality"] = country_code
+        data["gender"] = gender
+
+    # --- Passport number ---
+    passport_match = re.search(r"\b([A-Z]{2}[0-9]{6,8})\b", text)
+    if passport_match:
+        data["passport_number"] = passport_match.group(1)
+
+    # --- Place of birth ---
+    pob_match = re.search(r"(NAIROBI[, ]+KEN)", text, re.IGNORECASE)
+    if pob_match:
+        data["place_of_birth"] = pob_match.group(1).title()
+
+    # --- Dates ---
+    all_dates = re.findall(r"\d{1,2}\s+[A-Za-z]{3,}\s+\d{4}", text)
+    if len(all_dates) >= 3:
+        data["date_of_birth"] = all_dates[0]
+        data["date_of_issue"] = all_dates[1]
+        data["expiry_date"] = all_dates[2]
+    elif len(all_dates) == 2:
+        data["date_of_issue"] = all_dates[0]
+        data["expiry_date"] = all_dates[1]
+
+    return data
+
+def process_passport_image(image_bytes):
+    try:
+        image = byte_to_image(image_bytes)
+        processed_image = preprocess_image(image)
+
+        # convert to numpy array
+        np_image = np.array(processed_image)
+
+        ocr_text = extract_text_from_passport_image(np_image)
+
+        logging.info(f"Extracted text: {ocr_text}")
+
+        fields = extract_passport_fields(ocr_text)
+
+        logging.info(f"Final extracted Passport fields: {fields}")
+
+        return json.dumps(fields, indent=2)
+    except Exception as e:
+        logging.error(f"Error processing passport image: {str(e)}")
+
         return json.dumps({"error": str(e)})
