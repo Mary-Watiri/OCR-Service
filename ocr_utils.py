@@ -1,6 +1,7 @@
 import tempfile
 import cv2
 import easyocr
+import calendar
 import numpy as np
 import re
 import json
@@ -8,6 +9,7 @@ from datetime import datetime
 from typing import List, Dict
 from passporteye import read_mrz
 import logging
+import unicodedata
 from typing import Optional
 
 
@@ -549,13 +551,62 @@ def process_maisha_card_image(image_bytes):
 
         return json.dumps({"error": str(e)})
     
-def extract_text_from_passport_image(image_array):
-    reader = easyocr.Reader(['en'])
+
+def clean_text(text: str) -> str:
+    """
+    Cleans up OCR text:
+    - Fix known OCR errors
+    - Normalize spaces
+    """
+    text = text.replace("Aszu", "Issue")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def parse_mrz_date(date_str: str, is_expiry: bool = False) -> str:
+    """
+    Parses a date in YYMMDD format from the MRZ and returns DD/MM/YYYY format.
+    For expiry dates, always assume 2000+ as expiry dates are in the future.
+    """
+    if not date_str or len(date_str) != 6:
+        return ""
+    try:
+        year = int(date_str[0:2])
+        month = int(date_str[2:4])
+        day = int(date_str[4:6])
+
+        if is_expiry:
+            full_year = 2000 + year
+        else:
+            current_year = datetime.now().year % 100
+            century = 1900 if year > current_year else 2000
+            full_year = century + year
+
+        return f"{day:02d}/{month:02d}/{full_year:04d}"
+    except Exception:
+        return ""
+
+
+def standardize_date(date_str: str) -> str:
+    """
+    Converts a date like '19 Jan 1984' into '19/01/1984'
+    """
+    try:
+        dt = datetime.strptime(date_str, "%d %b %Y")
+        return dt.strftime("%d/%m/%Y")
+    except Exception:
+        return date_str
+
+
+
+def extract_text_from_passport_image(image_array: np.ndarray) -> str:
     results = reader.readtext(image_array, detail=0)
     return " ".join(results)
-    
+
 
 def extract_passport_fields(text: str) -> dict:
+    text = clean_text(text)
+
     data = {
         "passport_number": "",
         "surname": "",
@@ -570,64 +621,87 @@ def extract_passport_fields(text: str) -> dict:
     }
 
     # --- MRZ extraction ---
-    mrz_match = re.search(
-        r"P<([A-Z]{3})([A-Z<]+)<<([A-Z<]+)<([MF])",
-        text
-    )
-    if mrz_match:
-        country_code = mrz_match.group(1)
-        surname_raw = mrz_match.group(2)
-        given_names_raw = mrz_match.group(3)
-        gender = mrz_match.group(4)
+    mrz_lines = re.findall(r"[A-Z0-9<]{40,}", text)
+    if len(mrz_lines) >= 2:
+        line1 = mrz_lines[0].ljust(44, "<")
+        line2 = mrz_lines[1].ljust(44, "<")
 
-        surname = surname_raw.replace("<", "")
-        given_names = given_names_raw.replace("<", " ").strip()
+        surname_raw = line1[5:44].split("<<")[0]
+        given_names_section = line1[5:44].split("<<")[1] if "<<" in line1[5:44] else ""
+
+        surname = surname_raw.replace("<", "").strip()
+
+        # Parse and clean given names
+        given_names_parts = given_names_section.split("<")
+        given_names_clean = []
+        for w in given_names_parts:
+            w = w.strip()
+            if not w:
+                continue
+            # Remove initial S if followed by all uppercase letters (e.g. SGRACE -> GRACE)
+            if len(w) > 1 and w[0] == "S" and w[1:].isupper():
+                w = w[1:]
+            given_names_clean.append(w)
+
+        given_names = " ".join(given_names_clean)
+
+        passport_number = line2[0:9].replace("<", "").strip()
+        nationality = line2[10:13].replace("<", "").strip()
+        dob_raw = line2[13:19]
+        gender = line2[20]
+        expiry_raw = line2[21:27]
 
         data["surname"] = surname
         data["given_names"] = given_names
-        data["nationality"] = country_code
+        data["passport_number"] = passport_number
+        data["nationality"] = nationality
         data["gender"] = gender
 
-    # --- Passport number ---
-    passport_match = re.search(r"\b([A-Z]{2}[0-9]{6,8})\b", text)
-    if passport_match:
-        data["passport_number"] = passport_match.group(1)
+        if dob_raw:
+            data["date_of_birth"] = parse_mrz_date(dob_raw)
+        if expiry_raw:
+            data["expiry_date"] = parse_mrz_date(expiry_raw, is_expiry=True)
 
     # --- Place of birth ---
-    pob_match = re.search(r"(NAIROBI[, ]+KEN)", text, re.IGNORECASE)
+    pob_match = re.search(r"Place of Birth\s*[:\-]?\s*([A-Za-z ,.]*)", text, re.IGNORECASE)
     if pob_match:
-        data["place_of_birth"] = pob_match.group(1).title()
+        data["place_of_birth"] = pob_match.group(1).strip()
+    else:
+        pob_match = re.search(r"NAIROBI\s*[,\.]?\s*KEN", text, re.IGNORECASE)
+        if pob_match:
+            data["place_of_birth"] = "NAIROBI, KEN"
 
-    # --- Dates ---
+    # --- Other dates from text ---
     all_dates = re.findall(r"\d{1,2}\s+[A-Za-z]{3,}\s+\d{4}", text)
-    if len(all_dates) >= 3:
-        data["date_of_birth"] = all_dates[0]
-        data["date_of_issue"] = all_dates[1]
-        data["expiry_date"] = all_dates[2]
-    elif len(all_dates) == 2:
-        data["date_of_issue"] = all_dates[0]
-        data["expiry_date"] = all_dates[1]
+    for date_str in all_dates:
+        before_text = text.lower().split(date_str.lower())[0][-20:]
+        if "birth" in before_text and not data["date_of_birth"]:
+            data["date_of_birth"] = date_str
+        elif any(word in before_text for word in ["issue", "aszu"]) and not data["date_of_issue"]:
+            data["date_of_issue"] = date_str
+        elif "expir" in before_text and not data["expiry_date"]:
+            data["expiry_date"] = date_str
+
+    # --- Standardize date formats ---
+    for date_field in ["date_of_birth", "expiry_date", "date_of_issue"]:
+        if data[date_field]:
+            data[date_field] = standardize_date(data[date_field])
 
     return data
 
-def process_passport_image(image_bytes):
+def process_passport_image(image_bytes: bytes) -> str:
     try:
         image = byte_to_image(image_bytes)
         processed_image = preprocess_image(image)
-
-        # convert to numpy array
         np_image = np.array(processed_image)
 
         ocr_text = extract_text_from_passport_image(np_image)
-
-        logging.info(f"Extracted text: {ocr_text}")
+        logging.debug(f"Extracted text: {ocr_text}")
 
         fields = extract_passport_fields(ocr_text)
-
-        logging.info(f"Final extracted Passport fields: {fields}")
+        logging.debug(f"Final extracted Passport fields: {fields}")
 
         return json.dumps(fields, indent=2)
     except Exception as e:
         logging.error(f"Error processing passport image: {str(e)}")
-
         return json.dumps({"error": str(e)})
