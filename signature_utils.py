@@ -321,7 +321,18 @@ def extract_signature(image_bytes):
     x_max = min(img.shape[1] - 1, x_max + padding)
     
     roi = img[y_min:y_max + 1, x_min:x_max + 1]
+    # Crop mask to match the ROI
     roi_mask = mask[y_min:y_max + 1, x_min:x_max + 1]
+
+    # Strengthen ink regions using Otsu's threshold
+    _, roi_mask = cv2.threshold(roi_mask, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Remove small isolated noise
+    kernel = np.ones((2, 2), np.uint8)
+    roi_mask = cv2.morphologyEx(roi_mask, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    # Fill small gaps inside strokes
+    roi_mask = cv2.morphologyEx(roi_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
 
     # Convert to RGBA (transparent background)
     b, g, r = cv2.split(roi)
@@ -330,7 +341,7 @@ def extract_signature(image_bytes):
     # Enhanced confidence calculation
     density_score = min(1.0, cv2.countNonZero(roi_mask) / max(1, roi_mask.size))
     stroke_score = min(1.0, stroke_count / 12.0)
-    size_score = min(1.0, (roi_mask.size) / (100 * 100))  # Normalize by reasonable size
+    size_score = min(1.0, (roi_mask.size) / (100 * 100))  
     
     confidence = min(1.0, 
         0.25 * density_score + 

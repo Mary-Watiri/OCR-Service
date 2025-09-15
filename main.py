@@ -111,6 +111,26 @@ async def detect_signature(file: UploadFile = File(...)):
     except Exception as e:
         logger.error(f"Error detecting signature: {e}")
         return JSONResponse(status_code=500, content={"error": str(e)})
+    
+@app.post("/signature/detect/image")
+async def detect_signature_image(file: UploadFile = File(...)):
+    image_bytes = await file.read()
+    signature_img, confidence, status = await run_in_threadpool(extract_signature, image_bytes)
+
+    if signature_img is None:
+        return JSONResponse({
+            "signature_detected": False,
+            "confidence": float(confidence),
+            "message": status
+        })
+
+    # Resize & pad
+    signature_img = resize_and_pad_image(signature_img)
+    success, buffer = cv2.imencode(".png", signature_img)
+    if not success:
+        return JSONResponse(status_code=500, content={"error": "Encoding PNG failed"})
+
+    return StreamingResponse(io.BytesIO(buffer.tobytes()), media_type="image/png")
 
 @app.get("/")
 def read_root():
