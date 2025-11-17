@@ -7,6 +7,7 @@
     <list default="true" id="ab65af28-815c-4343-bb69-172d2f5bb39f" name="Changes" comment="added signature detecting and extracting logic">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/main.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/signature_utils.py" beforeDir="false" afterPath="$PROJECT_DIR$/signature_utils.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
