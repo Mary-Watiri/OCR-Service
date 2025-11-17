@@ -1,353 +1,179 @@
 import cv2
 import numpy as np
-from sklearn.cluster import KMeans
+from skimage.morphology import skeletonize
 
+# ------------------------------
+# Remove ruled lines
+# ------------------------------
 def remove_ruled_lines(ink_mask):
-    """
-    Remove long horizontal and vertical ruled lines from ink mask.
-    """
-    # Horizontal lines
-    horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
-    detected_h_lines = cv2.morphologyEx(ink_mask, cv2.MORPH_OPEN, horizontal_kernel, iterations=1)
-    
-    # Vertical lines
-    vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 40))
-    detected_v_lines = cv2.morphologyEx(ink_mask, cv2.MORPH_OPEN, vertical_kernel, iterations=1)
-    
-    # Combine detected lines
-    detected_lines = cv2.bitwise_or(detected_h_lines, detected_v_lines)
-    
-    # Remove lines from mask
-    no_lines = cv2.subtract(ink_mask, detected_lines)
-    return no_lines
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (60, 1))
+    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 60))
+    h_lines = cv2.morphologyEx(ink_mask, cv2.MORPH_OPEN, h_kernel)
+    v_lines = cv2.morphologyEx(ink_mask, cv2.MORPH_OPEN, v_kernel)
+    lines = cv2.bitwise_or(h_lines, v_lines)
+    return cv2.subtract(ink_mask, lines)
 
-def detect_signature_like_features(img, ink_mask):
-    """
-    Enhanced signature detection with better feature analysis.
-    Returns a score indicating how signature-like the image is.
-    """
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    
-    # Calculate aspect ratio of ink region
-    ys, xs = np.where(ink_mask > 0)
-    if len(ys) == 0 or len(xs) == 0:
-        return 0.0
-    
-    y_min, y_max = ys.min(), ys.max()
-    x_min, x_max = xs.min(), xs.max()
-    width = x_max - x_min
-    height = y_max - y_min
-    
-    if width == 0 or height == 0:
-        return 0.0
-    
-    aspect_ratio = max(width/height, height/width)
-    
-    # Signature typically has aspect ratio between 1:4 and 4:1
-    # But be more lenient for various signature styles
-    if aspect_ratio > 6:
-        return 0.3  # Very elongated, might still be signature
-    
-    # Calculate density (how concentrated the ink is)
-    ink_region_area = width * height
-    if ink_region_area == 0:
-        return 0.0
-        
-    ink_pixels = cv2.countNonZero(ink_mask)
-    density = ink_pixels / ink_region_area
-    
-    # Signatures typically have moderate density (not too sparse, not too dense)
-    # Broaden the acceptable range
-    if density < 0.05:  # Very sparse
-        return 0.4
-    if density > 0.85:  # Very dense
-        return 0.4
-    
-    # Calculate stroke width variation (signatures have varying stroke widths)
-    dist_transform = cv2.distanceTransform(ink_mask, cv2.DIST_L2, 5)
-    stroke_width_values = dist_transform[dist_transform > 0]
-    
-    if len(stroke_width_values) == 0:
-        return 0.0
-        
-    stroke_width_std = np.std(stroke_width_values)
-    stroke_width_mean = np.mean(stroke_width_values)
-    
-    # More lenient stroke width analysis
-    if stroke_width_std < 0.3 and stroke_width_mean < 2.0:
-        return 0.5  # Could still be a signature with uniform strokes
-    
-    # Calculate curvature and complexity
-    contours, _ = cv2.findContours(ink_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return 0.0
-        
-    # Calculate various signature characteristics
-    complexity_score = 0
-    curvature_score = 0
-    stroke_count = 0
-    
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area > 5:  # Smaller threshold for faint signatures
-            stroke_count += 1
-            
-            # Compactness (area/perimeter^2)
-            perimeter = cv2.arcLength(cnt, True)
-            if perimeter > 0:
-                compactness = 4 * np.pi * area / (perimeter * perimeter)
-                # Signatures are less compact than text characters
-                if compactness < 0.3:
-                    complexity_score += 0.8
-                elif compactness < 0.5:
-                    complexity_score += 0.5
-                else:
-                    complexity_score += 0.2
-            
-            # Curvature analysis
-            if len(cnt) > 4:
-                # Fit ellipse to assess curvature
-                ellipse = cv2.fitEllipse(cnt)
-                (center, axes, orientation) = ellipse
-                major_axis, minor_axis = max(axes), min(axes)
-                if minor_axis > 0:
-                    eccentricity = np.sqrt(1 - (minor_axis/major_axis)**2)
-                    curvature_score += eccentricity * 0.5
-    
-    # Normalize scores
-    if stroke_count > 0:
-        complexity_score /= stroke_count
-        curvature_score /= stroke_count
-    else:
-        complexity_score = 0
-        curvature_score = 0
-    
-    # Combine features into a final score with more balanced weights
-    signature_score = min(1.0, 
-        0.2 * min(1.0, density/0.6) +  # Density contribution
-        0.2 * min(1.0, stroke_width_std/3.0) +  # Stroke variation
-        0.3 * complexity_score +  # Shape complexity
-        0.2 * curvature_score +  # Curvature
-        0.1 * min(1.0, stroke_count/15.0)  # Number of strokes
-    )
-    
-    return signature_score
-
-def detect_and_reject_non_signatures(img, ink_mask):
-    """
-    More sophisticated non-signature detection with better thresholds.
-    """
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    height, width = img.shape[:2]
-    
-    # 1. Check ink coverage percentage
-    ink_pixels = cv2.countNonZero(ink_mask)
-    total_pixels = height * width
-    ink_fraction = ink_pixels / total_pixels
-    
-    # More lenient thresholds for signatures
-    if ink_fraction > 0.4:  # Too much ink (could be photo or document)
-        return False, "Rejected: excessive ink coverage"
-    if ink_fraction < 0.0001:  # Almost no ink
-        return False, "Rejected: insufficient ink"
-    
-    # 2. Check if this might be structured text
-    contours, _ = cv2.findContours(ink_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    if contours and len(contours) > 3:
-        # Calculate size and spacing regularity
-        areas = [cv2.contourArea(c) for c in contours if cv2.contourArea(c) > 5]
-        if areas and len(areas) > 5:
-            area_std = np.std(areas)
-            area_mean = np.mean(areas)
-            
-            # Text has more uniform character sizes than signatures
-            if area_std / area_mean < 0.4 and len(areas) > 8:
-                return False, "Rejected: appears to be structured text"
-    
-    # 3. Check for faces (but be careful with small images)
-    if height > 100 and width > 100:  # Only check reasonable sized images
-        try:
-            face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-            faces = face_cascade.detectMultiScale(gray, 1.1, 4, minSize=(30, 30))
-            if len(faces) > 0:
-                return False, "Rejected: contains faces"
-        except:
-            pass  # Skip face detection if it fails
-    
-    # 4. Check for document structure (lines, grids)
-    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
-    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=50, minLineLength=50, maxLineGap=10)
-    
-    if lines is not None and len(lines) > 5:
-        horizontal_lines = 0
-        vertical_lines = 0
-        for line in lines:
-            x1, y1, x2, y2 = line[0]
-            angle = np.arctan2(y2 - y1, x2 - x1) * 180 / np.pi
-            if abs(angle) < 15 or abs(angle - 180) < 15:
-                horizontal_lines += 1
-            elif abs(angle - 90) < 15 or abs(angle - 270) < 15:
-                vertical_lines += 1
-        
-        # If many structured lines, likely a document
-        if horizontal_lines > 4 and vertical_lines > 4:
-            return False, "Rejected: appears to be a structured document/form"
-    
-    # 5. Check color variation (signatures usually have consistent color)
-    if len(img.shape) == 3:
-        ink_pixels_rgb = img[ink_mask > 0]
-        if len(ink_pixels_rgb) > 10:
-            # Check if multiple distinct colors are present
-            color_std = np.std(ink_pixels_rgb, axis=0)
-            avg_color_std = np.mean(color_std)
-            if avg_color_std > 50:  # High color variation
-                return False, "Rejected: too many colors for a signature"
-    
-    return True, "OK"
-
+# ------------------------------
+# Enhance faint strokes
+# ------------------------------
 def enhance_strokes(img, ink_mask):
-    """
-    Enhanced stroke enhancement for faint signatures.
-    """
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-    # CLAHE for better contrast
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
     enhanced = clahe.apply(gray)
 
-    # Multiple thresholding techniques
-    # Adaptive threshold
-    thresh_adapt = cv2.adaptiveThreshold(
-        enhanced, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV,
-        21, 7
-    )
-    
-    # Otsu's threshold
-    _, thresh_otsu = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    
-    # Combine thresholds
-    combined_thresh = cv2.bitwise_or(thresh_adapt, thresh_otsu)
-    
-    # Combine with original ink mask
-    enhanced_mask = cv2.bitwise_or(ink_mask, combined_thresh)
-    
-    # Remove noise
-    kernel = np.ones((2, 2), np.uint8)
-    enhanced_mask = cv2.morphologyEx(enhanced_mask, cv2.MORPH_OPEN, kernel, iterations=1)
-    
-    # Fill small holes
-    enhanced_mask = cv2.morphologyEx(enhanced_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
-    
-    return enhanced_mask
+    t1 = cv2.adaptiveThreshold(enhanced, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                               cv2.THRESH_BINARY_INV, 15, 5)
+    _, t2 = cv2.threshold(enhanced, 0, 255,
+                          cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
+    combined = cv2.bitwise_or(t1, t2)
+    combined = cv2.bitwise_or(combined, ink_mask)
+
+    kernel = np.ones((2,2), np.uint8)
+    combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, kernel)
+    combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel)
+    return combined
+
+# ------------------------------
+# Shadow removal
+# ------------------------------
+def remove_phone_shadow(img, ink_mask=None):
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    L, A, B = cv2.split(lab)
+
+    smooth_L = cv2.GaussianBlur(L, (251, 251), 0)
+    shadow_map = smooth_L.astype(np.int32) - L.astype(np.int32)
+    shadow_map = cv2.normalize(shadow_map, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+    _, shadow_mask = cv2.threshold(shadow_map, 40, 255, cv2.THRESH_BINARY)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (45,45))
+    shadow_mask = cv2.morphologyEx(shadow_mask, cv2.MORPH_CLOSE, kernel)
+    shadow_mask = cv2.morphologyEx(shadow_mask, cv2.MORPH_OPEN, kernel)
+
+    h, w = shadow_mask.shape
+    min_area = (h*w)*0.03
+    contours, _ = cv2.findContours(shadow_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    clean_mask = np.zeros_like(shadow_mask)
+    for cnt in contours:
+        if cv2.contourArea(cnt) > min_area:
+            cv2.drawContours(clean_mask, [cnt], -1, 255, -1)
+    if ink_mask is not None:
+        clean_mask = cv2.bitwise_and(clean_mask, cv2.bitwise_not(ink_mask))
+
+    correction = cv2.GaussianBlur(shadow_map, (251,251),0)
+    correction = cv2.normalize(correction, None, 0, 80, cv2.NORM_MINMAX).astype(np.uint8)
+
+    mask_bool = (clean_mask>0) & (L<220)
+    L = np.where(mask_bool, cv2.add(L, correction), L)
+    L = np.clip(L, 0, 255).astype(np.uint8)
+    corrected_img = cv2.cvtColor(cv2.merge([L,A,B]), cv2.COLOR_LAB2BGR)
+    return corrected_img, clean_mask
+
+# ------------------------------
+# Reject non-signatures robustly
+# ------------------------------
+def reject_non_signatures(img, ink_mask):
+    h, w = img.shape[:2]
+    ink_frac = cv2.countNonZero(ink_mask) / (h*w)
+
+    if ink_frac > 0.8:
+        return False, "Too much ink: likely photo"
+    if ink_frac < 0.0005:
+        return False, "Too little ink"
+
+    contours, _ = cv2.findContours(ink_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area > 5000:  # large blobs indicate photo/texture
+            return False, "Large blob detected"
+        x,y,wc,hc = cv2.boundingRect(c)
+        aspect = wc/hc if hc>0 else 0
+        if aspect>15 or aspect<0.05:
+            return False, "Extreme contour aspect ratio"
+
+    # Skeleton analysis
+    skel = skeletonize((ink_mask>0).astype(np.uint8))
+    skel_pixels = np.count_nonzero(skel)
+    if skel_pixels < 50 or skel_pixels > ink_mask.size*0.4:
+        return False, "Skeleton indicates non-signature"
+
+    return True, "OK"
+
+# ------------------------------
+# Signature-likeness score
+# ------------------------------
+def signature_score(ink_mask):
+    ys, xs = np.where(ink_mask>0)
+    if len(xs)==0:
+        return 0
+    x1,x2,y1,y2 = xs.min(), xs.max(), ys.min(), ys.max()
+    w,h = x2-x1, y2-y1
+    if w==0 or h==0:
+        return 0
+
+    aspect = w/h
+    if aspect<0.5 or aspect>10:
+        return 0.2
+
+    density = cv2.countNonZero(ink_mask)/(w*h)
+    density_score = min(1.0, max(0.1, density*1.2))
+
+    dist = cv2.distanceTransform(ink_mask, cv2.DIST_L2,5)
+    sw = dist[dist>0]
+    stroke_score = min(1.0, (np.std(sw)+1)/3) if len(sw)>0 else 0.2
+
+    return 0.45*density_score + 0.55*stroke_score
+
+# ------------------------------
+# Main extractor
+# ------------------------------
 def extract_signature(image_bytes):
-    """
-    Enhanced signature extraction with better signature recognition.
-    """
-    nparr = np.frombuffer(image_bytes, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    data = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(data, cv2.IMREAD_COLOR)
     if img is None:
-        return None, 0.0, "Invalid image"
+        return None, 0, "Invalid image", None
 
-    # --- Detect ink regions with multiple color ranges ---
+    # Step 0: initial ink mask
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    
-    # Broader color ranges for various ink colors
-    # Blue ink
-    blue_mask = cv2.inRange(hsv, np.array([85, 20, 20]), np.array([145, 255, 255]))
-    
-    # Black ink (broader range)
-    black_mask = cv2.inRange(hsv, np.array([0, 0, 0]), np.array([180, 255, 120]))
-    
-    # Red ink
-    red_mask1 = cv2.inRange(hsv, np.array([0, 20, 20]), np.array([15, 255, 255]))
-    red_mask2 = cv2.inRange(hsv, np.array([155, 20, 20]), np.array([180, 255, 255]))
-    red_mask = cv2.bitwise_or(red_mask1, red_mask2)
-    
-    # Green ink
-    green_mask = cv2.inRange(hsv, np.array([30, 20, 20]), np.array([95, 255, 255]))
-    
-    # Combine all ink masks
-    ink_mask = cv2.bitwise_or(blue_mask, black_mask)
-    ink_mask = cv2.bitwise_or(ink_mask, red_mask)
-    ink_mask = cv2.bitwise_or(ink_mask, green_mask)
+    blue = cv2.inRange(hsv, (90,50,50), (130,255,255))
+    black = cv2.inRange(hsv, (0,0,0), (180,255,120))
+    ink_mask = cv2.bitwise_or(blue, black)
 
-    # Remove ruled notebook lines
+    # Step 1: remove shadows
+    img, shadow_mask = remove_phone_shadow(img, ink_mask=ink_mask)
+
+    # Step 2: recompute ink mask
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    blue = cv2.inRange(hsv, (90,50,50), (130,255,255))
+    black = cv2.inRange(hsv, (0,0,0), (180,255,120))
+    ink_mask = cv2.bitwise_or(blue, black)
+
+    # Step 3: clean & enhance ink
     ink_mask = remove_ruled_lines(ink_mask)
-
-    # Enhance faint strokes
     ink_mask = enhance_strokes(img, ink_mask)
 
-    # --- Check if this is likely a signature ---
-    is_signature, rejection_reason = detect_and_reject_non_signatures(img, ink_mask)
-    if not is_signature:
-        return None, 0.0, rejection_reason
+    # Step 4: reject non-signatures
+    ok, reason = reject_non_signatures(img, ink_mask)
+    if not ok:
+        return None, 0, reason, shadow_mask
 
-    # Calculate signature-like features score
-    signature_score = detect_signature_like_features(img, ink_mask)
-    
-    # More lenient threshold for signature recognition
-    if signature_score < 0.35:
-        return None, signature_score, "Rejected: doesn't resemble a signature"
+    # Step 5: signature-likeness score
+    score = signature_score(ink_mask)
+    if score < 0.35:
+        return None, score, "Rejected: not signature-like", shadow_mask
 
-    # --- Build final mask ---
-    contours, _ = cv2.findContours(ink_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    stroke_count = sum(1 for c in contours if cv2.contourArea(c) > 5)
-    
-    if stroke_count < 2:
-        return None, 0.0, "Rejected: not enough ink strokes"
+    # Step 6: extract signature region
+    ys,xs = np.where(ink_mask>0)
+    y1,y2 = max(0, ys.min()-5), min(img.shape[0], ys.max()+5)
+    x1,x2 = max(0, xs.min()-5), min(img.shape[1], xs.max()+5)
 
-    mask = np.zeros_like(ink_mask)
-    for cnt in contours:
-        if cv2.contourArea(cnt) > 5:  # Smaller area threshold for faint signatures
-            cv2.drawContours(mask, [cnt], -1, 255, -1)
+    roi = img[y1:y2, x1:x2]
+    mask_roi = ink_mask[y1:y2, x1:x2]
+    _, mask_roi = cv2.threshold(mask_roi,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)
 
-    if cv2.countNonZero(mask) == 0:
-        return None, 0.0, "Rejected: no valid signature region"
+    b,g,r = cv2.split(roi)
+    rgba = cv2.merge([b,g,r,mask_roi])
 
-    # Crop tightly to signature
-    ys, xs = np.where(mask > 0)
-    y_min, y_max = ys.min(), ys.max()
-    x_min, x_max = xs.min(), xs.max()
-    
-    # Add some padding
-    padding = 5
-    y_min = max(0, y_min - padding)
-    y_max = min(img.shape[0] - 1, y_max + padding)
-    x_min = max(0, x_min - padding)
-    x_max = min(img.shape[1] - 1, x_max + padding)
-    
-    roi = img[y_min:y_max + 1, x_min:x_max + 1]
-    # Crop mask to match the ROI
-    roi_mask = mask[y_min:y_max + 1, x_min:x_max + 1]
+    confidence = min(1.0, 0.3*score + 0.5*min(1, cv2.countNonZero(mask_roi)/(mask_roi.size*0.4)) + 0.2)
 
-    # Strengthen ink regions using Otsu's threshold
-    _, roi_mask = cv2.threshold(roi_mask, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    # Remove small isolated noise
-    kernel = np.ones((2, 2), np.uint8)
-    roi_mask = cv2.morphologyEx(roi_mask, cv2.MORPH_OPEN, kernel, iterations=1)
-
-    # Fill small gaps inside strokes
-    roi_mask = cv2.morphologyEx(roi_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-    # Convert to RGBA (transparent background)
-    b, g, r = cv2.split(roi)
-    rgba = cv2.merge([b, g, r, roi_mask])
-
-    # Enhanced confidence calculation
-    density_score = min(1.0, cv2.countNonZero(roi_mask) / max(1, roi_mask.size))
-    stroke_score = min(1.0, stroke_count / 12.0)
-    size_score = min(1.0, (roi_mask.size) / (100 * 100))  
-    
-    confidence = min(1.0, 
-        0.25 * density_score + 
-        0.25 * stroke_score + 
-        0.4 * signature_score + 
-        0.1 * size_score
-    )
-
-    return rgba, confidence, "OK"
+    return rgba, float(confidence), "OK", shadow_mask

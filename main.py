@@ -83,7 +83,8 @@ async def process_passport(file: UploadFile = File(...)):
 async def detect_signature(file: UploadFile = File(...)):
     try:
         image_bytes = await file.read()
-        signature_img, confidence, status = await run_in_threadpool(extract_signature, image_bytes)
+        # Unpack 4 values
+        signature_img, confidence, status, _ = await run_in_threadpool(extract_signature, image_bytes)
 
         if signature_img is None:
             return JSONResponse({
@@ -98,7 +99,7 @@ async def detect_signature(file: UploadFile = File(...)):
         if not success:
             return JSONResponse(status_code=500, content={"error": "Encoding PNG failed"})
 
-        # Always return JSON response with base64 image
+        # Return JSON with base64 image
         b64_img = base64.b64encode(buffer).decode("utf-8")
         return JSONResponse({
             "signature_detected": True,
@@ -107,15 +108,20 @@ async def detect_signature(file: UploadFile = File(...)):
             "signature_base64": b64_img,
             "signature_format": "image/png"
         })
-        
+
     except Exception as e:
         logger.error(f"Error detecting signature: {e}")
         return JSONResponse(status_code=500, content={"error": str(e)})
-    
+
 @app.post("/signature/detect/image")
-async def detect_signature_image(file: UploadFile = File(...)):
+async def detect_signature_image(file: UploadFile = File(...), return_shadow: bool = Query(False)):
+    """
+    Detect signature and optionally return the shadow mask for debugging.
+    Set ?return_shadow=true to get shadow mask.
+    """
     image_bytes = await file.read()
-    signature_img, confidence, status = await run_in_threadpool(extract_signature, image_bytes)
+    # Unpack 4 values: signature and shadow mask
+    signature_img, confidence, status, shadow_mask = await run_in_threadpool(extract_signature, image_bytes)
 
     if signature_img is None:
         return JSONResponse({
@@ -124,12 +130,23 @@ async def detect_signature_image(file: UploadFile = File(...)):
             "message": status
         })
 
-    # Resize & pad
+    # Resize & pad signature
     signature_img = resize_and_pad_image(signature_img)
     success, buffer = cv2.imencode(".png", signature_img)
     if not success:
         return JSONResponse(status_code=500, content={"error": "Encoding PNG failed"})
 
+    # If user wants the shadow mask
+    if return_shadow:
+        # Convert mask to 3-channel image for visualization
+        shadow_vis = cv2.cvtColor(shadow_mask, cv2.COLOR_GRAY2BGR)
+        success_mask, buffer_mask = cv2.imencode(".png", shadow_vis)
+        if not success_mask:
+            return JSONResponse(status_code=500, content={"error": "Encoding shadow mask failed"})
+
+        return StreamingResponse(io.BytesIO(buffer_mask.tobytes()), media_type="image/png")
+
+    # Otherwise return signature image
     return StreamingResponse(io.BytesIO(buffer.tobytes()), media_type="image/png")
 
 @app.get("/")
