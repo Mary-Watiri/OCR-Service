@@ -8,6 +8,7 @@ RUN pip install --no-cache-dir --default-timeout=100 -r requirements.txt
 
 COPY main.py .
 COPY ocr_utils.py .
+COPY signature_utils.py .
 
 EXPOSE 8000
 
